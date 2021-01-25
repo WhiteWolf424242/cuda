@@ -429,7 +429,7 @@ int main()
 
 
 
-    // GPU VERSION WITH TEXTURES - GLOBAL ATOMICS //
+    // GPU VERSION WITH TEXTURES  //
 
     // Initialize texture
     // Ehhez transform data to color:
