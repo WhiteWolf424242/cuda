@@ -143,54 +143,60 @@ __global__ void BUFF_gpu_normalize_image(unsigned int* out, uchar4* input, const
 }
 
 
-// TEXTÚRÁS VÁLTOZAT W/ GLOBAL ATOMICS //
-
-__global__ void TEX_gpu_histo_global_atomics( unsigned int* output, cudaTextureObject_t texObjInput, int W, int H0 )
+// TEXTÚRÁS VÁLTOZAT W/ GLOBAL AND SHARED ATOMICS //
+// global
+__global__ void TEX_gpu_histo_global_atomics( unsigned int* output, cudaTextureObject_t texObjInput, int W )
 {
-    // texture coordinates:
-    unsigned int x0 = blockIdx.x*blockDim.x + threadIdx.x;
-    unsigned int y0 = blockIdx.y*blockDim.y + threadIdx.y;
+    // linear block index within 2D grid
+    int B = blockIdx.x + blockIdx.y * gridDim.x;
 
-    float4 pixels = tex2D<float4>(texObjInput, x0+0.5, y0+0.5);
-    unsigned int fij = (unsigned int)(((0.3 * pixels.x) + (0.59 * pixels.y) + (0.11 * pixels.z))*255);
+    //Output index start for this block's histogram:
+    int I = B*(256);
+    unsigned int* H = output + I;
 
-    atomicAdd(output+fij,1);
+    // process pixel blocks horizontally
+    // updates our block's partial histogram in global memory
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    for (int x = threadIdx.x; x < W; x += blockDim.x)
+    {
+        float4 pixels = tex2D<float4>(texObjInput, x+0.5, y+0.5);
+        unsigned int fij = (unsigned int)(((0.3 * pixels.x) + (0.59 * pixels.y) + (0.11 * pixels.z))*255);
+        atomicAdd(H+fij, 1);
+    }
 }
 
-/* // TEX-SHARED ATOMICS lenne - nem tudtam kitalálni.
-__global__ void TEX_gpu_histo_shared_atomics( unsigned int* histo_output, cudaTextureObject_t texObjInput, int W, int H ){
-    //munkacsop. nem a globálisban növelget, hanem shared memóriás blokkot: histograms a shared memoryban
-    // ha végzett, visszamásoljuk globálba
+ // TEX-SHARED ATOMICS
+__global__ void TEX_gpu_histo_shared_atomics( unsigned int* output, cudaTextureObject_t texObjInput, int W ){
     __shared__ unsigned int histo[256];
 
-    // texture coordinates:
-    unsigned int x0 = blockIdx.x*blockDim.x + threadIdx.x;
-    unsigned int y0 = blockIdx.y*blockDim.y + threadIdx.y;
-
-    float4 pixel = tex2D<float4>(texObjInput, x0+0.5, y0+0.5);
-    unsigned int intensity = (unsigned int)(((0.3 * pixel.x) + (0.59 * pixel.y) + (0.11 * pixel.z))*255);
-
-    //Number of threads in the block:
     int Nthreads = blockDim.x * blockDim.y;
-    //Linear thread idx:
     int LinID = threadIdx.x + threadIdx.y * blockDim.x;
     //zero histogram:
     for (int i = LinID; i < 256; i += Nthreads){ histo[i] = 0; }
     __syncthreads();
 
-    atomicAdd(&histo[intensity], 1);
+    // linear block index within 2D grid
+    int B = blockIdx.x + blockIdx.y * gridDim.x;
+
+    // process pixel blocks horizontally
+    // updates the partial histogram in shared memory
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    for (int x = threadIdx.x; x < W; x += blockDim.x)
+    {
+        float4 pixels = tex2D<float4>(texObjInput, x+0.5, y+0.5);
+        unsigned int fij = (unsigned int)(((0.3 * pixels.x) + (0.59 * pixels.y) + (0.11 * pixels.z))*255);
+        atomicAdd(histo+fij, 1);
+    }
     __syncthreads();
 
-
-    int B = blockIdx.x + blockIdx.y * gridDim.x;
-    int I = B*256;
-    unsigned int* H0 = histo_output + I;
+    //Output index start for this block's histogram:
+    int I = B*(256);
+    unsigned int* H = output + I;
 
     //Copy shared memory histograms to global memory:
     for (int i = LinID; i < 256; i += Nthreads)
     {
-       //atomicAdd(histo_output+i,histo[i]);
-       H0[i] = histo[i];
+        H[i] = histo[i];
     }
 }
 __global__ void TEX_gpu_histo_accumulate(const unsigned int* in, int nBlocks, unsigned int* out){
@@ -203,7 +209,7 @@ __global__ void TEX_gpu_histo_accumulate(const unsigned int* in, int nBlocks, un
         out[i] = sum;
     }
 }
-*/
+
 
 __global__ void TEX_gpu_normalize_image(unsigned int* out, cudaTextureObject_t texObjInput, const unsigned int* histo, int W, int H){
     // g_ij = floor( (L-1 = 255)* SUM_{n=0}^{f_i,j}[ p_n ])
@@ -235,6 +241,7 @@ int main()
     static const std::string output_filename2 = "gpu_out1_buff-gl.jpg";
     static const std::string output_filename3 = "gpu_out2_buff-sh.jpg";
     static const std::string output_filename4 = "gpu_out3_tex-gl.jpg";
+    static const std::string output_filename5 = "gpu_out3_tex-sh.jpg";
 
     static const int block_size = 16;
     int nBlocksH = 0; //number of blocks vertically
@@ -268,6 +275,7 @@ int main()
     std::vector<unsigned int> hostOutput(w*h);
     std::vector<unsigned int> hostOutputShared(w*h);
     std::vector<unsigned int> hostOutputTEX(w*h);
+    std::vector<unsigned int> hostOutputTEXShared(w*h);
 
     unsigned char* pInput    = nullptr;
     unsigned int*  hPartials = nullptr;
@@ -371,7 +379,7 @@ int main()
             dim3 dimGrid( 1, nBlocksH + 1);
             dim3 dimBlock( block_size, block_size );
             cudaEventRecord(evt[0]);
-            BUFF_gpu_histo_shared_atomics<<<dimGrid, dimBlock>>>(hPartials, (uchar4*)pInput, w);
+            BUFF_gpu_histo_global_atomics<<<dimGrid, dimBlock>>>(hPartials, (uchar4*)pInput, w);
             err = cudaGetLastError();
             if (err != cudaSuccess){ std::cout << "CUDA error in first kernel call: " << cudaGetErrorString(err) << "\n"; return -1; }
             cudaEventRecord(evt[1]);
@@ -421,8 +429,49 @@ int main()
 
 
 
-    // GPU VERSION WITH TEXTURES - GLOBAL ATOMICS
+    // GPU VERSION WITH TEXTURES - GLOBAL ATOMICS //
 
+    // Initialize texture
+    // Ehhez transform data to color:
+    std::vector<color> input(w*h);
+    std::transform(data0, data0+w*h, input.begin(), 
+    [](rawcolor c){ return color{c.r/255.0f, c.g/255.0f, c.b/255.0f, c.a/255.0f}; }
+    );
+
+    //Kell egy cudaArray ami az adatot tárolja
+    //Kell egy cudaResourceDesc ami jellemzi
+    //Kell cudaTextureDesc ami jellemzi a textúrát
+    //Creation: cudaCreateTextureObject fv -> cudaTextureObject_t objektum, át lehet adni kernelnek
+    
+    // Cuda Array:
+    cudaChannelFormatDesc channelDescInput = cudaCreateChannelDesc(32,32,32,32, cudaChannelFormatKindFloat);
+    cudaArray* aInput;
+
+    // Malloc and load to device:
+    err = cudaMallocArray(&aInput,&channelDescInput, w, h);
+    if( err != cudaSuccess){ std::cout << "Error allocating CUDA memory (tex): " << cudaGetErrorString(err) << "\n"; return -1; }
+    err = cudaMemcpyToArray(aInput, 0, 0, input.data(), w*h*sizeof(color), cudaMemcpyHostToDevice);
+    if( err != cudaSuccess){ std::cout << "Error copying memory to device (tex): " << cudaGetErrorString(err) << "\n"; return -1; }
+
+    // cudaResourceDesc írja le, hogy cudaArray-ben van a cucc:
+    cudaResourceDesc resdescInput{}; // 0-ra inicializálva
+    resdescInput.resType = cudaResourceTypeArray; //megmondja hogy array van
+    resdescInput.res.array.array = aInput; // pointer rá
+
+    // cudaTextureDesc jellemzi a textúrát:
+    cudaTextureDesc texDesc{}; // 0 init
+    texDesc.addressMode[0] = cudaAddressModeClamp; // mi a van a htáron: az utolsó szín: Clamp
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.filterMode = cudaFilterModeLinear; //lineáris szűrés -> koordinátákhoz +0.5 kiolvasásnál hogy ne az interpolációt olvassa
+    texDesc.readMode = cudaReadModeElementType; // nincs adatkonv. float-ra
+    texDesc.normalizedCoords = 0; // [0.0, texture_size] a tartomány
+
+    // Mindent összekapcs:
+    cudaTextureObject_t texObjInput = 0;
+    err = cudaCreateTextureObject(&texObjInput, &resdescInput, &texDesc, nullptr); 
+    if( err != cudaSuccess){ std::cout << "Error creating texture object: " << cudaGetErrorString(err) << "\n"; return -1; }
+
+    // global atomics
     float dt3 = 0.0f;
     {
         // reset outputs
@@ -435,62 +484,18 @@ int main()
         err = cudaMemset(pImageOut, 0, w*h*sizeof(unsigned int) );
         if( err != cudaSuccess){ std::cout << "Error setting memory to zero: " << cudaGetErrorString(err) << "\n"; return -1; }
 
-
-        // Initialize texture
-        // Ehhez transform data to color:
-        std::vector<color> input(w*h);
-        std::transform(data0, data0+w*h, input.begin(), 
-        [](rawcolor c){ return color{c.r/255.0f, c.g/255.0f, c.b/255.0f, c.a/255.0f}; }
-        );
-
-        //Kell egy cudaArray ami az adatot tárolja
-        //Kell egy cudaResourceDesc ami jellemzi
-        //Kell cudaTextureDesc ami jellemzi a textúrát
-        //Creation: cudaCreateTextureObject fv -> cudaTextureObject_t objektum, át lehet adni kernelnek
-        
-        // Cuda Array:
-        cudaChannelFormatDesc channelDescInput = cudaCreateChannelDesc(32,32,32,32, cudaChannelFormatKindFloat);
-        cudaArray* aInput;
-
-        // Malloc and load to device:
-        err = cudaMallocArray(&aInput,&channelDescInput, w, h);
-        if( err != cudaSuccess){ std::cout << "Error allocating CUDA memory (tex): " << cudaGetErrorString(err) << "\n"; return -1; }
-        err = cudaMemcpyToArray(aInput, 0, 0, input.data(), w*h*sizeof(color), cudaMemcpyHostToDevice);
-        if( err != cudaSuccess){ std::cout << "Error copying memory to device (tex): " << cudaGetErrorString(err) << "\n"; return -1; }
-
-        // cudaResourceDesc írja le, hogy cudaArray-ben van a cucc:
-        cudaResourceDesc resdescInput{}; // 0-ra inicializálva
-        resdescInput.resType = cudaResourceTypeArray; //megmondja hogy array van
-        resdescInput.res.array.array = aInput; // pointer rá
-
-        // cudaTextureDesc jellemzi a textúrát:
-        cudaTextureDesc texDesc{}; // 0 init
-        texDesc.addressMode[0] = cudaAddressModeClamp; // mi a van a htáron: az utolsó szín: Clamp
-        texDesc.addressMode[1] = cudaAddressModeClamp;
-        texDesc.filterMode = cudaFilterModeLinear; //lineáris szűrés -> koordinátákhoz +0.5 kiolvasásnál hogy ne az interpolációt olvassa
-        texDesc.readMode = cudaReadModeElementType; // nincs adatkonv. float-ra
-        texDesc.normalizedCoords = 0; // [0.0, texture_size] a tartomány
-
-        // Mindent összekapcs:
-        cudaTextureObject_t texObjInput = 0;
-        err = cudaCreateTextureObject(&texObjInput, &resdescInput, &texDesc, nullptr); 
-        if( err != cudaSuccess){ std::cout << "Error creating texture object: " << cudaGetErrorString(err) << "\n"; return -1; }
-
         cudaEvent_t evt[6];
         for(auto& e : evt){ cudaEventCreate(&e); }
-        // 1 - calculate full histos ( in 1 step)//
+        // 1 - calculate histos //
         {
-            dim3 dimGrid( w / block_size, h / block_size + 1 );
+            dim3 dimGrid( 1, nBlocksH + 1);
             dim3 dimBlock( block_size, block_size );
             cudaEventRecord(evt[0]);
-            //TEX_gpu_histo_shared_atomics<<<dimGrid, dimBlock>>>( hPartials, texObjInput, w, h); - nem tudtam működésre bírni.
-            TEX_gpu_histo_global_atomics<<<dimGrid, dimBlock>>>( hOutput, texObjInput, w, h);
+            TEX_gpu_histo_global_atomics<<<dimGrid, dimBlock>>>( hPartials, texObjInput, w);
             err = cudaGetLastError();
             if (err != cudaSuccess){ std::cout << "CUDA error in first kernel call: " << cudaGetErrorString(err) << "\n"; return -1; }
             cudaEventRecord(evt[1]);
         }
-
-        /* NOT USED by TEX_gpu_histo_global_atomics
         // 2 - accumulate histos//
         {
             dim3 dimGrid( 1 );
@@ -501,8 +506,6 @@ int main()
             if (err != cudaSuccess){ std::cout << "CUDA error in second kernel call: " << cudaGetErrorString(err) << "\n"; return -1; }
             cudaEventRecord(evt[3]);
         }
-        */ 
-
         // 3- normalize //
         {
             dim3 dimGrid( w / block_size, h / block_size + 1);
@@ -533,7 +536,73 @@ int main()
     }
 
 
+    // Shared atomics
+    float dt4 = 0.0f;
+    {
+        // reset outputs
+        err = cudaMemset(hPartials, 0, nBlocksH*256*sizeof(unsigned int) );
+        if( err != cudaSuccess){ std::cout << "Error setting memory to zero: " << cudaGetErrorString(err) << "\n"; return -1; }
+
+        err = cudaMemset(hOutput, 0, 256*sizeof(unsigned int) );
+        if( err != cudaSuccess){ std::cout << "Error setting memory to zero: " << cudaGetErrorString(err) << "\n"; return -1; }
+
+        err = cudaMemset(pImageOut, 0, w*h*sizeof(unsigned int) );
+        if( err != cudaSuccess){ std::cout << "Error setting memory to zero: " << cudaGetErrorString(err) << "\n"; return -1; }
+
+        cudaEvent_t evt[6];
+        for(auto& e : evt){ cudaEventCreate(&e); }
+        // 1 - calculate histos //
+        {
+            dim3 dimGrid( 1, nBlocksH + 1);
+            dim3 dimBlock( block_size, block_size );
+            cudaEventRecord(evt[0]);
+            TEX_gpu_histo_shared_atomics<<<dimGrid, dimBlock>>>( hPartials, texObjInput, w); 
+            err = cudaGetLastError();
+            if (err != cudaSuccess){ std::cout << "CUDA error in first kernel call: " << cudaGetErrorString(err) << "\n"; return -1; }
+            cudaEventRecord(evt[1]);
+        }
+        // 2 - accumulate histos//
+        {
+            dim3 dimGrid( 1 );
+            dim3 dimBlock( 256 );
+            cudaEventRecord(evt[2]);
+            TEX_gpu_histo_accumulate<<<dimGrid, dimBlock>>>(hPartials, nBlocksH, hOutput);
+            err = cudaGetLastError();
+            if (err != cudaSuccess){ std::cout << "CUDA error in second kernel call: " << cudaGetErrorString(err) << "\n"; return -1; }
+            cudaEventRecord(evt[3]);
+        }
+        // 3- normalize //
+        {
+            dim3 dimGrid( w / block_size, h / block_size + 1);
+            dim3 dimBlock( block_size, block_size );
+            cudaEventRecord(evt[4]);
+            TEX_gpu_normalize_image<<<dimGrid, dimBlock>>>(pImageOut, texObjInput, hOutput, w, h);
+            err = cudaGetLastError();
+            if (err != cudaSuccess){ std::cout << "CUDA error in third kernel call: " << cudaGetErrorString(err) << "\n"; return -1; }
+            cudaEventRecord(evt[5]);
+        }
+        cudaDeviceSynchronize();
+    
+        //Calculate time:
+        cudaEventSynchronize(evt[5]);
+        float dt = 0.0f;//milliseconds
+        cudaEventElapsedTime(&dt, evt[0], evt[1]);
+        dt4 = dt;
+        cudaEventElapsedTime(&dt, evt[2], evt[3]);
+        dt4 += dt;
+        cudaEventElapsedTime(&dt, evt[4], evt[5]);
+        dt4 += dt;
+        for(auto& e : evt){ cudaEventDestroy(e); }
+        std::cout << "GPU-TEX shared atomics computation took: " << dt4  << " ms\n";
+
+        // eredmény visszamásolása gazda oldalra
+        err = cudaMemcpy( hostOutputTEXShared.data(), pImageOut, w*h*sizeof(unsigned int), cudaMemcpyDeviceToHost );
+        if( err != cudaSuccess){ std::cout << "Error copying memory to host at end: " << cudaGetErrorString(err) << "\n"; return -1; }
+    }
+
+
     stbi_image_free(data0);
+
     err = cudaFree( hPartials );
     if( err != cudaSuccess){ std::cout << "Error freeing allocation: " << cudaGetErrorString(err) << "\n"; return -1; }
 
@@ -542,9 +611,6 @@ int main()
 
     err = cudaFree( pImageOut );
     if( err != cudaSuccess){ std::cout << "Error freeing allocation: " << cudaGetErrorString(err) << "\n"; return -1; }
-
-
-
 
 
     /* CONVERT WRITE & FINISH */
@@ -574,5 +640,5 @@ int main()
     convert_and_write(output_filename2, hostOutput);
     convert_and_write(output_filename3, hostOutputShared);
     convert_and_write(output_filename4, hostOutputTEX);
-
+    convert_and_write(output_filename5, hostOutputTEXShared);
 }
